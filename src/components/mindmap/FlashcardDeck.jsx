@@ -1,11 +1,9 @@
-import { useState, useEffect, useMemo, useRef } from "react";
-
-let _fcUid = 0;
-const uid = () => 'fc' + (_fcUid++);
-
-const STROKE = { 'c-purple':'#534AB7','c-teal':'#0F6E56','c-coral':'#993C1D','c-pink':'#993556','c-gray':'#5F5E5A' };
-const FILL   = { 'c-purple':'#EFE9FB','c-teal':'#E3F3EE','c-coral':'#FBEAE2','c-pink':'#FBE7ED','c-gray':'#EEEDEA' };
-const isVideoSrc = src => src.startsWith('data:video') || /\.(mp4|webm|ogg|mov|avi|mkv)(\?|$)/i.test(src);
+import { useState, useEffect, useMemo } from "react";
+import {
+  STROKE, FILL, isVideoSrc,
+  ensureBlocks, makeBlock,
+  BlockRow, SlashMenu, BlockView,
+} from "./blockEditor";
 
 export default function FlashcardDeck({ mapLabel, root, onClose, onToggleLearned, onUpdate }) {
   // Baum aller Karten (ohne Wurzel) mit Verschachtelungstiefe
@@ -23,16 +21,16 @@ export default function FlashcardDeck({ mapLabel, root, onClose, onToggleLearned
   const [flipped, setFlipped] = useState(false);
   const [lightbox, setLightbox] = useState(null);
   const [editing, setEditing] = useState(false);
-  const [defV, setDefV] = useState('');
-  const [noteV, setNoteV] = useState('');
-  const fileInputRef = useRef(null);
-  const videoInputRef = useRef(null);
+  const [slashOpenFor, setSlashOpenFor] = useState(null); // Block-ID, für den das Slash-Menü offen ist
+  const [focusBlockId, setFocusBlockId] = useState(null);
+  const [, forceTick] = useState(0);
 
   const node = items[idx]?.node;
   const accent = node ? (STROKE[node.color] || '#534AB7') : '#534AB7';
   const fill   = node ? (FILL[node.color] || '#EFE9FB') : '#EFE9FB';
 
-  useEffect(() => { setFlipped(false); setEditing(false); }, [idx]);
+  // Bei jedem Kartenwechsel: Bearbeitungsmodus & Slash-Menü zurücksetzen
+  useEffect(() => { setFlipped(false); setEditing(false); setSlashOpenFor(null); setFocusBlockId(null); }, [idx]);
 
   useEffect(() => {
     const fn = e => {
@@ -48,40 +46,62 @@ export default function FlashcardDeck({ mapLabel, root, onClose, onToggleLearned
 
   if (!node) return null;
 
-  const handleFiles = files => {
-    files.forEach(file => {
-      if (!file.type.startsWith('image/')) return;
-      const reader = new FileReader();
-      reader.onload = ev => {
-        if (!node.images) node.images = [];
-        node.images.push({ id: uid(), src: ev.target.result, caption: file.name });
-        onUpdate && onUpdate();
-      };
-      reader.readAsDataURL(file);
-    });
-  };
-  const handleVideoFiles = files => {
-    files.forEach(file => {
-      if (!file.type.startsWith('video/')) return;
-      const reader = new FileReader();
-      reader.onload = ev => {
-        if (!node.videos) node.videos = [];
-        node.videos.push({ id: uid(), src: ev.target.result, caption: file.name });
-        onUpdate && onUpdate();
-      };
-      reader.readAsDataURL(file);
-    });
-  };
-  const removeImage = id => { node.images = (node.images||[]).filter(i=>i.id!==id); onUpdate && onUpdate(); };
-  const removeVideo = id => { node.videos = (node.videos||[]).filter(v=>v.id!==id); onUpdate && onUpdate(); };
+  // Migriert bei Bedarf die alten Felder (definition/note/images/videos) einmalig in node.blocks -
+  // dasselbe kanonische Format, das auch das DetailPanel in Home.jsx verwendet.
+  const blocks = ensureBlocks(node);
 
-  const startEdit = () => { setDefV(node.definition || ''); setNoteV(node.note || ''); setEditing(true); };
-  const saveEdit  = () => { node.definition = defV; node.note = noteV; setEditing(false); onUpdate && onUpdate(); };
-  const cancelEdit = () => setEditing(false);
+  // Erzwingt ein Re-Render dieser Komponente (Blöcke werden per Mutation auf node.blocks
+  // aktualisiert) und benachrichtigt zusätzlich die App, damit z.B. der Lernfortschritt
+  // im Header aktuell bleibt.
+  const rr = () => { forceTick(t => t + 1); onUpdate && onUpdate(); };
+
+  const updateBlock = (id, newBlock) => {
+    const i = blocks.findIndex(b => b.id === id);
+    if (i === -1) return;
+    const copy = [...blocks];
+    copy[i] = newBlock;
+    node.blocks = copy;
+    rr();
+  };
+  const removeBlock = id => {
+    let copy = blocks.filter(b => b.id !== id);
+    if (copy.length === 0) copy = [makeBlock('text')];
+    node.blocks = copy;
+    rr();
+  };
+  const insertBlockAfter = (id, newBlock) => {
+    const i = blocks.findIndex(b => b.id === id);
+    const copy = [...blocks];
+    copy.splice(i + 1, 0, newBlock);
+    node.blocks = copy;
+    setFocusBlockId(newBlock.id);
+    rr();
+  };
+  const replaceBlockType = (id, cmd) => {
+    const i = blocks.findIndex(b => b.id === id);
+    if (i === -1) return;
+    const fresh = cmd.make();
+    fresh.id = blocks[i].id; // Position/Identität beibehalten
+    const copy = [...blocks];
+    copy[i] = fresh;
+    node.blocks = copy;
+    setSlashOpenFor(null);
+    setFocusBlockId(fresh.id);
+    rr();
+  };
+  const handleEnter = id => {
+    const blk = blocks.find(b => b.id === id);
+    const newType = (blk && (blk.type === 'bullet' || blk.type === 'numbered')) ? blk.type : 'text';
+    insertBlockAfter(id, makeBlock(newType));
+  };
+  const handleBackspaceEmpty = id => {
+    const i = blocks.findIndex(b => b.id === id);
+    if (i <= 0) return; // ersten Block nicht per Backspace löschen
+    removeBlock(id);
+    setFocusBlockId(blocks[i - 1]?.id || null);
+  };
 
   const S_BTN = { fontFamily:'inherit', fontSize:13, background:'#fff', color:'#1F1E1C', border:'0.5px solid #E6E4DF', borderRadius:8, height:38, cursor:'pointer', padding:'0 14px' };
-  const S_LABEL = { fontSize:10, fontWeight:700, color:'#6B6963', textTransform:'uppercase', letterSpacing:'.08em', marginBottom:4 };
-  const S_TA = { fontFamily:'inherit', fontSize:13, padding:'8px 10px', width:'100%', resize:'vertical', border:'0.5px solid #D7D4CC', borderRadius:8, background:'#fff', color:'#1F1E1C', boxSizing:'border-box', lineHeight:1.5 };
 
   return (
     <div style={{position:'fixed',inset:0,background:'#F2F1ED',zIndex:2000,display:'flex'}}>
@@ -94,7 +114,7 @@ export default function FlashcardDeck({ mapLabel, root, onClose, onToggleLearned
         </div>
 
         {/* Baum */}
-        <div style={{flex:1, overflowY:'auto', padding:'8px 6px'}}>
+        <div style={{flex:1, overflowY:'auto', padding:'8px 6px', minHeight:0}}>
           {items.map((it, i) => (
             <div key={it.node.id} style={{paddingLeft: it.depth*16 + 6, position:'relative'}}>
               {it.depth > 0 && <span style={{position:'absolute', left: (it.depth-1)*16 + 12, top:0, bottom:0, width:1, background:'#E6E4DF'}}/>}
@@ -113,62 +133,58 @@ export default function FlashcardDeck({ mapLabel, root, onClose, onToggleLearned
           ))}
         </div>
 
-        {/* Editor */}
+        {/* Block-Editor (gleiches Format wie Home.jsx-DetailPanel) */}
         {editing ? (
-          <div style={{borderTop:'0.5px solid #E6E4DF', padding:14, display:'flex', flexDirection:'column', gap:10, flexShrink:0, maxHeight:'70%', overflowY:'auto'}}>
-            <div style={{display:'flex', alignItems:'center', gap:6, fontSize:13, fontWeight:600}}>
+          <div style={{borderTop:'0.5px solid #E6E4DF', padding:14, display:'flex', flexDirection:'column', gap:2, flexShrink:0, maxHeight:'70%', overflowY:'auto'}}>
+            <div style={{display:'flex', alignItems:'center', gap:6, fontSize:13, fontWeight:600, marginBottom:8}}>
               <span style={{width:8, height:8, borderRadius:'50%', background:accent}}/>
               {node.label}
             </div>
-            <div>
-              <div style={S_LABEL}>Definition</div>
-              <textarea rows={5} value={defV} onChange={e=>setDefV(e.target.value)} style={S_TA} placeholder="Definition..."/>
-            </div>
-            <div>
-              <div style={S_LABEL}>Notiz</div>
-              <textarea rows={3} value={noteV} onChange={e=>setNoteV(e.target.value)} style={S_TA} placeholder="Notiz..."/>
-            </div>
-            <div>
-              <div style={S_LABEL}>Bilder</div>
-              {node.images && node.images.length > 0 && (
-                <div style={{display:'flex', gap:6, flexWrap:'wrap', marginBottom:6}}>
-                  {node.images.map(img => (
-                    <div key={img.id} style={{position:'relative'}}>
-                      <img src={img.src} alt={img.caption} onClick={()=>setLightbox(img.src)} style={{width:54, height:54, objectFit:'cover', borderRadius:6, border:'0.5px solid #D7D4CC', cursor:'zoom-in'}}/>
-                      <button onClick={()=>removeImage(img.id)} style={{position:'absolute', top:2, right:2, background:'rgba(153,53,86,.9)', color:'#fff', border:'none', borderRadius:'50%', width:16, height:16, fontSize:9, cursor:'pointer', display:'flex', alignItems:'center', justifyContent:'center'}}>✕</button>
-                    </div>
-                  ))}
+
+            {blocks.map((block, i) => {
+              let listNumber = null;
+              if (block.type === 'numbered') {
+                let n = 1;
+                for (let j = i - 1; j >= 0 && blocks[j].type === 'numbered'; j--) n++;
+                listNumber = n;
+              }
+              return (
+                <div key={block.id}>
+                  <BlockRow
+                    block={block}
+                    theme={null}
+                    accentColor={accent}
+                    listNumber={listNumber}
+                    autoFocus={focusBlockId===block.id}
+                    onChange={nb=>updateBlock(block.id, nb)}
+                    onRemove={()=>removeBlock(block.id)}
+                    onEnter={()=>handleEnter(block.id)}
+                    onBackspaceEmpty={()=>handleBackspaceEmpty(block.id)}
+                    onSlash={open=>setSlashOpenFor(open ? block.id : (slashOpenFor===block.id ? null : slashOpenFor))}
+                  />
+                  {slashOpenFor === block.id && (
+                    <SlashMenu theme={null}
+                      onClose={()=>setSlashOpenFor(null)}
+                      onPick={cmd=>{
+                        // Das abschließende "/" aus dem Textinhalt entfernen, dann Blocktyp ersetzen
+                        updateBlock(block.id, { ...block, content: block.content.slice(0,-1) });
+                        replaceBlockType(block.id, cmd);
+                      }}/>
+                  )}
                 </div>
-              )}
-              <button onClick={()=>fileInputRef.current?.click()} style={{...S_BTN, width:'100%', height:30, fontSize:12}}>＋ Bild hinzufügen</button>
-              <input ref={fileInputRef} type="file" accept="image/*" multiple style={{display:'none'}} onChange={e=>{handleFiles(Array.from(e.target.files)); e.target.value='';}}/>
-            </div>
-            <div>
-              <div style={S_LABEL}>Videos</div>
-              {node.videos && node.videos.length > 0 && (
-                <div style={{display:'flex', gap:6, flexWrap:'wrap', marginBottom:6}}>
-                  {node.videos.map(vid => (
-                    <div key={vid.id} style={{position:'relative'}}>
-                      <div onClick={()=>setLightbox(vid.src)} style={{width:54, height:54, borderRadius:6, overflow:'hidden', position:'relative', background:'#1F1E1C', cursor:'zoom-in'}}>
-                        <video src={vid.src} muted preload="metadata" style={{width:'100%', height:'100%', objectFit:'cover', pointerEvents:'none'}}/>
-                        <span style={{position:'absolute', inset:0, display:'flex', alignItems:'center', justifyContent:'center', color:'#fff', fontSize:14}}>▶</span>
-                      </div>
-                      <button onClick={()=>removeVideo(vid.id)} style={{position:'absolute', top:2, right:2, background:'rgba(153,53,86,.9)', color:'#fff', border:'none', borderRadius:'50%', width:16, height:16, fontSize:9, cursor:'pointer', display:'flex', alignItems:'center', justifyContent:'center'}}>✕</button>
-                    </div>
-                  ))}
-                </div>
-              )}
-              <button onClick={()=>videoInputRef.current?.click()} style={{...S_BTN, width:'100%', height:30, fontSize:12}}>＋ Video hinzufügen</button>
-              <input ref={videoInputRef} type="file" accept="video/*" multiple style={{display:'none'}} onChange={e=>{handleVideoFiles(Array.from(e.target.files)); e.target.value='';}}/>
-            </div>
-            <div style={{display:'flex', gap:6}}>
-              <button onClick={saveEdit} style={{...S_BTN, flex:1, background:accent, color:'#fff', borderColor:accent}}>✓ Speichern</button>
-              <button onClick={cancelEdit} style={S_BTN}>Abbrechen</button>
-            </div>
+              );
+            })}
+
+            <button onClick={()=>insertBlockAfter(blocks[blocks.length-1].id, makeBlock('text'))}
+              style={{alignSelf:'flex-start', background:'transparent', border:'none', color:'#9B9994', fontSize:12.5, cursor:'pointer', padding:'6px 0', display:'flex', alignItems:'center', gap:6}}>
+              ＋ Block hinzufügen
+            </button>
+
+            <button onClick={()=>setEditing(false)} style={{...S_BTN, marginTop:8, background:accent, color:'#fff', borderColor:accent}}>✓ Fertig</button>
           </div>
         ) : (
           <div style={{borderTop:'0.5px solid #E6E4DF', padding:10, flexShrink:0}}>
-            <button onClick={startEdit} style={{...S_BTN, width:'100%'}}>✏️ Karte bearbeiten</button>
+            <button onClick={()=>setEditing(true)} style={{...S_BTN, width:'100%'}}>✏️ Karte bearbeiten</button>
           </div>
         )}
       </div>
@@ -208,36 +224,11 @@ export default function FlashcardDeck({ mapLabel, root, onClose, onToggleLearned
                   <span style={{width:10, height:10, borderRadius:'50%', background:accent}}/>
                   <div style={{fontSize:17, fontWeight:600}}>{node.label}</div>
                 </div>
-                <div style={{flex:1, overflowY:'auto', minHeight:0, WebkitOverflowScrolling:'touch', display:'flex', flexDirection:'column', gap:14, paddingRight:4}}>
-                  <div>
-                    <div style={{fontSize:10, fontWeight:700, color:'#6B6963', textTransform:'uppercase', letterSpacing:'.08em', marginBottom:4}}>Definition</div>
-                    <div style={{fontSize:14, color:'#3C3B38', lineHeight:1.6, whiteSpace:'pre-wrap'}}>{node.definition || <span style={{color:'#B3B0A9', fontStyle:'italic'}}>Keine Definition vorhanden</span>}</div>
-                  </div>
-                  {node.note ? (
-                    <div style={{padding:10, background:fill, borderRadius:8, fontSize:12, color:'#5F5E5A', borderLeft:'3px solid '+accent, whiteSpace:'pre-wrap'}}>📝 {node.note}</div>
-                  ) : null}
-                  {node.images && node.images.length > 0 && (
-                    <div>
-                      <div style={{fontSize:10, fontWeight:700, color:'#6B6963', textTransform:'uppercase', letterSpacing:'.08em', marginBottom:6}}>Bilder</div>
-                      <div style={{display:'flex', gap:8, flexWrap:'wrap'}}>
-                        {node.images.map(img => (
-                          <img key={img.id} src={img.src} alt={img.caption} onClick={e=>{e.stopPropagation(); setLightbox(img.src);}} style={{width:80, height:80, objectFit:'cover', borderRadius:8, border:'0.5px solid #D7D4CC', cursor:'zoom-in'}}/>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                  {node.videos && node.videos.length > 0 && (
-                    <div>
-                      <div style={{fontSize:10, fontWeight:700, color:'#6B6963', textTransform:'uppercase', letterSpacing:'.08em', marginBottom:6}}>Videos</div>
-                      <div style={{display:'flex', gap:8, flexWrap:'wrap'}}>
-                        {node.videos.map(vid => (
-                          <div key={vid.id} onClick={e=>{e.stopPropagation(); setLightbox(vid.src);}} style={{width:80, height:80, borderRadius:8, overflow:'hidden', position:'relative', background:'#1F1E1C', cursor:'zoom-in'}}>
-                            <video src={vid.src} muted preload="metadata" style={{width:'100%', height:'100%', objectFit:'cover', pointerEvents:'none'}}/>
-                            <span style={{position:'absolute', inset:0, display:'flex', alignItems:'center', justifyContent:'center', color:'#fff', fontSize:22}}>▶</span>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
+                <div style={{flex:1, overflowY:'auto', minHeight:0, WebkitOverflowScrolling:'touch', paddingRight:4}} onClick={e=>e.stopPropagation()}>
+                  {blocks.every(b => ['text','heading','quote','bullet','numbered','todo'].includes(b.type) && !b.content) ? (
+                    <span style={{color:'#B3B0A9', fontStyle:'italic', fontSize:14}}>Keine Inhalte vorhanden</span>
+                  ) : (
+                    <BlockView blocks={blocks} theme={null} accentColor={accent} onOpenLightbox={src=>setLightbox(src)}/>
                   )}
                 </div>
               </div>
